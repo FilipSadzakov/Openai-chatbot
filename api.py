@@ -12,7 +12,10 @@ from pydantic import BaseModel
 from openai import OpenAI
 
 from core.menu_match import find_category_in_text, find_dish_in_text, filter_dishes_by_category
+from core.versioning import sha256_file
+from core.postcheck import extract_allowed_ingredients, detect_unknown_ingredient
 from data.category_synonyms import CATEGORY_SYNONYMS
+from services.context_payload import build_context_payload
 from services.logger import log_event
 
 # Load .env locally (Render uses Environment Variables)
@@ -24,11 +27,16 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-# Load dishes database
-with open("data/jela.json", "r", encoding="utf-8") as f:
-    DISHES = json.load(f)
-
 MODEL_NAME = "gpt-4.1-mini"
+
+# Version fingerprints (for tracing/debugging)
+PROMPT_VERSION = "v1"
+DATA_PATH = "data/jela.json"
+DATA_VERSION = sha256_file(DATA_PATH)
+
+# Load dishes database
+with open(DATA_PATH, "r", encoding="utf-8") as f:
+    DISHES = json.load(f)
 
 app = FastAPI()
 
@@ -46,51 +54,23 @@ class ChatRequest(BaseModel):
     message: str
 
 
-# -----------------------------
-# ENGLISH-ONLY INTERNAL CONTEXT
-# -----------------------------
-def context_for_dish(dish: dict) -> str:
-    return (
-        "These are verified facts from the internal Šumska1 menu database.\n"
-        f"Dish name: {dish.get('name', '')}\n"
-        f"Ingredients: {', '.join(dish.get('ingredients', []))}\n"
-        f"Vegan: {'yes' if dish.get('vegan') else 'no'}\n"
-        f"Contains gluten: {'yes' if dish.get('contains_gluten') else 'no'}\n"
-        f"Sugar-free (no added sugar): {'yes' if dish.get('sugar_free') else 'no'}\n"
-        f"Contains soy: {'yes' if dish.get('contains_soy') else 'no'}\n"
-        f"Contains nuts: {'yes' if dish.get('contains_nuts') else 'no'}\n"
-        f"Contains sesame: {'yes' if dish.get('contains_sesame') else 'no'}\n"
-        f"Spicy: {'yes' if dish.get('spicy') else 'no'}\n"
-        f"Notes: {dish.get('notes', '')}\n\n"
-        "Rules:\n"
-        "- Answer strictly using these fields only.\n"
-        "- If something is not explicitly present here, say you do not have that information and advise the user to confirm with the host/staff.\n"
-        "- Never guarantee 100% safety for allergies, intolerances, celiac disease, diabetes, or any medical condition.\n"
-    )
-
-
-def context_for_category_list(dishes: list, category: str) -> str:
-    lines = [
-        "This is a list of dishes from the internal Šumska1 menu database.",
-        f"All dishes below have category: {category}.",
-        "",
-    ]
-    for d in dishes:
-        lines.append(f"- {d.get('name','')} (ingredients: {', '.join(d.get('ingredients', []))})")
-
-    lines.append("")
-    lines.append(
-        "Rules:\n"
-        "- When the user asks about this category, list the dish names from above.\n"
-        "- Do not invent dishes that are not on the list.\n"
-        "- Always remind users with allergies or health conditions to confirm with the host/staff."
-    )
-    return "\n".join(lines)
-
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def db_only_answer_from_payload(payload: dict) -> str:
+    dish = payload.get("dish") or {}
+    name = dish.get("name") or "Ovo jelo"
+    ingredients = dish.get("ingredients") or []
+    ing_text = ", ".join(ingredients) if ingredients else "nisu navedeni u bazi"
+
+    # Keep user-facing Serbian
+    lines = [
+        f"Prema našoj bazi, {name} sadrži: {ing_text}.",
+        "Ako imaš alergije ili posebne zdravstvene potrebe, obavezno proveri sa domaćinom/osobljem.",
+    ]
+    return " ".join(lines)
 
 
 @app.post("/chat")
@@ -104,14 +84,17 @@ def chat(req: ChatRequest):
         log_event({
             "event": "chat_empty_message",
             "request_id": request_id,
+            "prompt_version": PROMPT_VERSION,
+            "data_version": DATA_VERSION,
             "latency_ms": latency_ms,
         })
         return {"answer": "Napiši pitanje pa ću ti odgovoriti.", "request_id": request_id, "latency_ms": latency_ms}
 
-    # Log request
     log_event({
         "event": "chat_request",
         "request_id": request_id,
+        "prompt_version": PROMPT_VERSION,
+        "data_version": DATA_VERSION,
         "message": user_input,
     })
 
@@ -125,8 +108,10 @@ def chat(req: ChatRequest):
         log_event({
             "event": "chat_fallback_question",
             "request_id": request_id,
-            "message": user_input,
+            "prompt_version": PROMPT_VERSION,
+            "data_version": DATA_VERSION,
             "latency_ms": latency_ms,
+            "message": user_input,
         })
         return {
             "answer": (
@@ -148,39 +133,34 @@ def chat(req: ChatRequest):
             "Do not provide medical advice.\n"
             "If the user mentions allergies, celiac disease, diabetes, insulin resistance, or any health condition, "
             "always tell them to confirm with the host/staff.\n"
-            "When internal database context is provided, answer strictly from that context.\n"
-            "If a detail is not explicitly present in the context, say you don't have that information and ask them to confirm with the host."
+            "You will receive CONTEXT_JSON from the internal menu database.\n"
+            "Answer strictly using CONTEXT_JSON only.\n"
+            "If a detail is not explicitly present in CONTEXT_JSON, say you don't have that information and ask the user to confirm with the host."
         ),
     }
 
     convo_messages = [base_system_message]
 
-    # 4) Add internal context (ENGLISH)
-    if category:
-        dishes_in_cat = filter_dishes_by_category(DISHES, category)
-        if dishes_in_cat:
-            convo_messages.append({"role": "system", "content": context_for_category_list(dishes_in_cat, category)})
-        else:
-            convo_messages.append({
-                "role": "system",
-                "content": (
-                    "The internal database has no dishes for this category.\n"
-                    "Rules:\n"
-                    "- Do not invent dish names.\n"
-                    "- Tell the user you currently do not have items in the database for this category and advise them to confirm with the host/staff.\n"
-                    "Always answer the user in Serbian."
-                )
-            })
+    # 4) Build structured context payload (JSON)
+    if dish is not None:
+        payload = build_context_payload(dish=dish, category=None, category_dishes=None)
     else:
-        convo_messages.append({"role": "system", "content": context_for_dish(dish)})
+        dishes_in_cat = filter_dishes_by_category(DISHES, category)
+        payload = build_context_payload(dish=None, category=category, category_dishes=dishes_in_cat)
 
+    convo_messages.append({
+        "role": "system",
+        "content": "CONTEXT_JSON:\n" + json.dumps(payload, ensure_ascii=False),
+    })
     convo_messages.append({"role": "user", "content": user_input})
 
-    # Log LLM call intent (not the full prompt)
     log_event({
         "event": "llm_call",
         "request_id": request_id,
+        "prompt_version": PROMPT_VERSION,
+        "data_version": DATA_VERSION,
         "model": MODEL_NAME,
+        "context_mode": payload.get("mode"),
         "dish_found": bool(dish),
         "category": category,
     })
@@ -191,11 +171,33 @@ def chat(req: ChatRequest):
     )
 
     reply = (response.choices[0].message.content or "").strip()
+
+    # 5) Post-check (dish mode only): if unknown ingredient appears, override with DB-only answer
+    if payload.get("mode") == "dish":
+        allowed = extract_allowed_ingredients(payload) or []
+        triggered, unknown_items = detect_unknown_ingredient(reply, allowed)
+        if triggered:
+            safe_reply = db_only_answer_from_payload(payload)
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+
+            log_event({
+                "event": "chat_postcheck_triggered",
+                "request_id": request_id,
+                "prompt_version": PROMPT_VERSION,
+                "data_version": DATA_VERSION,
+                "latency_ms": latency_ms,
+                "unknown_items": unknown_items,
+            })
+
+            return {"answer": safe_reply, "request_id": request_id, "latency_ms": latency_ms}
+
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
     log_event({
         "event": "chat_response",
         "request_id": request_id,
+        "prompt_version": PROMPT_VERSION,
+        "data_version": DATA_VERSION,
         "latency_ms": latency_ms,
         "answer": reply,
     })
