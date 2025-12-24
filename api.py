@@ -1,27 +1,41 @@
+# api.py
+
 import os
 import json
-import unicodedata
+import time
+import uuid
 from dotenv import load_dotenv
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-# Učitaj .env (lokalno) i API ključ (na Renderu ide preko Environment Variables)
+from core.menu_match import find_category_in_text, find_dish_in_text, filter_dishes_by_category
+from data.category_synonyms import CATEGORY_SYNONYMS
+from services.logger import log_event
+
+# Load .env locally (Render uses Environment Variables)
 load_dotenv()
+
 api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or Render Environment Variables.")
+
 client = OpenAI(api_key=api_key)
 
-# Učitaj bazu jela
-with open("jela.json", "r", encoding="utf-8") as f:
+# Load dishes database
+with open("data/jela.json", "r", encoding="utf-8") as f:
     DISHES = json.load(f)
+
+MODEL_NAME = "gpt-4.1-mini"
 
 app = FastAPI()
 
-# CORS za Wix
+# CORS for Wix
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://sumska1.com"],  # kasnije možeš zameniti sa ["https://sumska1.com"]
+    allow_origins=["https://sumska1.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,120 +47,44 @@ class ChatRequest(BaseModel):
 
 
 # -----------------------------
-# NORMALIZACIJA (š → s, č → c…)
+# ENGLISH-ONLY INTERNAL CONTEXT
 # -----------------------------
-def normalize(text: str) -> str:
-    text = text.lower()
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', text)
-        if unicodedata.category(c) != 'Mn'
-    )
-
-
-# -----------------------------
-# PRONALAŽENJE KONKRETNOG JELA
-# -----------------------------
-def nadji_jelo_u_pitanju(tekst: str):
-    t = normalize(tekst)
-    for dish in DISHES:
-        if normalize(dish["name"]) in t:
-            return dish
-    return None
-
-
-# -----------------------------
-# PRONALAŽENJE KATEGORIJE U PITANJU
-# -----------------------------
-def nadji_kategoriju_u_pitanju(tekst: str):
-    t = normalize(tekst)
-
-    # slatko / desert
-    if any(kw in t for kw in ["slatko", "slatkisi", "slatkis", "dezert", "desert", "kolac", "kolaci"]):
-        return "dezert"
-
-    # paste / testenine
-    if any(kw in t for kw in ["pasta", "paste", "testenina", "testenine"]):
-        return "pasta"
-
-    # salate
-    if "salat" in t:
-        return "salata"
-
-    # čorbe / supe
-    if any(kw in t for kw in ["corba", "čorba", "supa", "supe"]):
-        return "corba"
-
-    # doručak
-    if any(kw in t for kw in ["dorucak", "doručak"]):
-        return "dorucak"
-
-    # namazi
-    if "namaz" in t or "namaze" in t:
-        return "namaz"
-
-    # hleb / lepinje
-    if any(kw in t for kw in ["hleb", "lepinj"]):
-        return "hleb"
-
-    # prilozi
-    if "prilog" in t:
-        return "prilog"
-
-    # glavna jela
-    if any(kw in t for kw in ["glavno jelo", "glavna jela", "rucak", "ručak"]):
-        return "glavno_jelo"
-
-    return None
-
-
-def filtriraj_jela_po_kategoriji(category: str):
-    return [d for d in DISHES if d.get("category") == category]
-
-
-# -----------------------------
-# KONTKST ZA KONKRETNO JELO
-# -----------------------------
-def formiraj_kontekst_za_jelo(dish: dict) -> str:
+def context_for_dish(dish: dict) -> str:
     return (
-        "Ovo su proverene informacije iz interne baze jela restorana Šumska1.\n"
-        f"Naziv jela: {dish['name']}\n"
-        f"Sastojci: {', '.join(dish['ingredients'])}\n"
-        f"Vegansko: {'da' if dish.get('vegan') else 'ne'}\n"
-        f"Sadrži gluten: {'da' if dish.get('contains_gluten') else 'ne'}\n"
-        f"Bez dodatog šećera: {'da' if dish.get('sugar_free') else 'ne'}\n"
-        f"Sadrži soju: {'da' if dish.get('contains_soy') else 'ne'}\n"
-        f"Sadrži orašaste plodove: {'da' if dish.get('contains_nuts') else 'ne'}\n"
-        f"Sadrži susam: {'da' if dish.get('contains_sesame') else 'ne'}\n"
-        f"Ljuto: {'da' if dish.get('spicy') else 'ne'}\n"
-        f"Napomene: {dish.get('notes', '')}\n\n"
-        "Odgovaraj isključivo na osnovu ovih podataka.\n"
-        "Ako nešto nije eksplicitno navedeno, reci gostu da obavezno proveri sa domaćinom.\n"
-        "Nikada ne garantuj 100% bezbednost za alergije, intolerancije ili hronične bolesti."
+        "These are verified facts from the internal Šumska1 menu database.\n"
+        f"Dish name: {dish.get('name', '')}\n"
+        f"Ingredients: {', '.join(dish.get('ingredients', []))}\n"
+        f"Vegan: {'yes' if dish.get('vegan') else 'no'}\n"
+        f"Contains gluten: {'yes' if dish.get('contains_gluten') else 'no'}\n"
+        f"Sugar-free (no added sugar): {'yes' if dish.get('sugar_free') else 'no'}\n"
+        f"Contains soy: {'yes' if dish.get('contains_soy') else 'no'}\n"
+        f"Contains nuts: {'yes' if dish.get('contains_nuts') else 'no'}\n"
+        f"Contains sesame: {'yes' if dish.get('contains_sesame') else 'no'}\n"
+        f"Spicy: {'yes' if dish.get('spicy') else 'no'}\n"
+        f"Notes: {dish.get('notes', '')}\n\n"
+        "Rules:\n"
+        "- Answer strictly using these fields only.\n"
+        "- If something is not explicitly present here, say you do not have that information and advise the user to confirm with the host/staff.\n"
+        "- Never guarantee 100% safety for allergies, intolerances, celiac disease, diabetes, or any medical condition.\n"
     )
 
 
-# -----------------------------
-# KONTKST ZA LISTU JELA (KATEGORIJA)
-# -----------------------------
-def formiraj_kontekst_za_listu_jela(jela: list, category: str) -> str:
+def context_for_category_list(dishes: list, category: str) -> str:
     lines = [
-        "Ovo je lista jela iz interne baze restorana Šumska1.",
-        f"Sva dole navedena jela imaju kategoriju: {category}.",
+        "This is a list of dishes from the internal Šumska1 menu database.",
+        f"All dishes below have category: {category}.",
         "",
     ]
-
-    for dish in jela:
-        lines.append(f"- {dish['name']} (sastojci: {', '.join(dish['ingredients'])})")
+    for d in dishes:
+        lines.append(f"- {d.get('name','')} (ingredients: {', '.join(d.get('ingredients', []))})")
 
     lines.append("")
     lines.append(
-        "Kada gost pita za ovu kategoriju (npr. slatko, paste, salate, čorbe), "
-        "nabroj mu po nazivu sva jela sa liste iznad. "
-        "Ne izmišljaj nova jela koja nisu na listi. "
-        "Naglasis da su jela veganska (ako jesu) i uvek napomeni da za alergije "
-        "i posebne zdravstvene potrebe treba da proveri sa domaćinom."
+        "Rules:\n"
+        "- When the user asks about this category, list the dish names from above.\n"
+        "- Do not invent dishes that are not on the list.\n"
+        "- Always remind users with allergies or health conditions to confirm with the host/staff."
     )
-
     return "\n".join(lines)
 
 
@@ -157,70 +95,109 @@ def health():
 
 @app.post("/chat")
 def chat(req: ChatRequest):
+    request_id = uuid.uuid4().hex
+    t0 = time.perf_counter()
+
     user_input = (req.message or "").strip()
     if not user_input:
-        return {"answer": "Napiši pitanje pa ću ti odgovoriti."}
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        log_event({
+            "event": "chat_empty_message",
+            "request_id": request_id,
+            "latency_ms": latency_ms,
+        })
+        return {"answer": "Napiši pitanje pa ću ti odgovoriti.", "request_id": request_id, "latency_ms": latency_ms}
 
+    # Log request
+    log_event({
+        "event": "chat_request",
+        "request_id": request_id,
+        "message": user_input,
+    })
+
+    # 1) Detect dish/category
+    dish = find_dish_in_text(user_input, DISHES)
+    category = find_category_in_text(user_input, CATEGORY_SYNONYMS) if dish is None else None
+
+    # 2) Follow-up question if nothing matches (NO LLM call)
+    if dish is None and category is None:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        log_event({
+            "event": "chat_fallback_question",
+            "request_id": request_id,
+            "message": user_input,
+            "latency_ms": latency_ms,
+        })
+        return {
+            "answer": (
+                "Da li pitaš za neko konkretno jelo (napiši naziv), "
+                "ili za kategoriju (npr. dezert, pasta, salata, čorba)?"
+            ),
+            "request_id": request_id,
+            "latency_ms": latency_ms,
+        }
+
+    # 3) Base system prompt (ENGLISH, but user output must be Serbian)
     base_system_message = {
         "role": "system",
         "content": (
-            "Ti si chatbot veganskog prostora Šumska1.\n"
-            "Odgovaraš kratko, jasno i na srpskom.\n"
-            "Ne izmišljaš sastojke. Ne daješ medicinske savete.\n"
-            "Za osobe sa alergijama, celijakijom, dijabetesom ili insulinskom rezistencijom "
-            "uvek naglašavaš da moraju da provere sa domaćinom.\n"
-            "Kada imaš kontekst o jelima iz interne baze, odgovaraj isključivo na osnovu tih podataka."
+            "You are the chatbot for Šumska1 (a vegan venue).\n"
+            "Always answer the user in Serbian.\n"
+            "Be short, clear, and factual.\n"
+            "Do not invent ingredients or menu items.\n"
+            "Do not provide medical advice.\n"
+            "If the user mentions allergies, celiac disease, diabetes, insulin resistance, or any health condition, "
+            "always tell them to confirm with the host/staff.\n"
+            "When internal database context is provided, answer strictly from that context.\n"
+            "If a detail is not explicitly present in the context, say you don't have that information and ask them to confirm with the host."
         ),
     }
 
     convo_messages = [base_system_message]
 
-    # 1) Kategorija?
-    category = nadji_kategoriju_u_pitanju(user_input)
-
-    # 2) Konkretno jelo samo ako nije kategorija
-    dish = nadji_jelo_u_pitanju(user_input) if category is None else None
-
+    # 4) Add internal context (ENGLISH)
     if category:
-        jela = filtriraj_jela_po_kategoriji(category)
-        if jela:
-            convo_messages.append({
-                "role": "system",
-                "content": formiraj_kontekst_za_listu_jela(jela, category)
-            })
+        dishes_in_cat = filter_dishes_by_category(DISHES, category)
+        if dishes_in_cat:
+            convo_messages.append({"role": "system", "content": context_for_category_list(dishes_in_cat, category)})
         else:
             convo_messages.append({
                 "role": "system",
                 "content": (
-                    "Nema nijednog jela u bazi za ovu kategoriju.\n"
-                    "Nemoj izmišljati nazive jela. Reci gostu da trenutno "
-                    "nema podataka u bazi i da proveri sa domaćinom."
+                    "The internal database has no dishes for this category.\n"
+                    "Rules:\n"
+                    "- Do not invent dish names.\n"
+                    "- Tell the user you currently do not have items in the database for this category and advise them to confirm with the host/staff.\n"
+                    "Always answer the user in Serbian."
                 )
             })
-
-    elif dish:
-        convo_messages.append({
-            "role": "system",
-            "content": formiraj_kontekst_za_jelo(dish)
-        })
-
     else:
-        convo_messages.append({
-            "role": "system",
-            "content": (
-                "Nema podataka o ovom jelu niti o traženoj kategoriji u bazi.\n"
-                "NE izmišljaj sastojke ni nutritivne informacije.\n"
-                "Možeš dati samo opštu informaciju o veganskoj ishrani, "
-                "ali reci gostu da za konkretno jelo mora da proveri sa osobljem."
-            )
-        })
+        convo_messages.append({"role": "system", "content": context_for_dish(dish)})
 
     convo_messages.append({"role": "user", "content": user_input})
 
+    # Log LLM call intent (not the full prompt)
+    log_event({
+        "event": "llm_call",
+        "request_id": request_id,
+        "model": MODEL_NAME,
+        "dish_found": bool(dish),
+        "category": category,
+    })
+
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=convo_messages
+        model=MODEL_NAME,
+        messages=convo_messages,
     )
 
-    reply = response.choices[0].message.content
-    return {"answer": reply}
+    reply = (response.choices[0].message.content or "").strip()
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    log_event({
+        "event": "chat_response",
+        "request_id": request_id,
+        "latency_ms": latency_ms,
+        "answer": reply,
+    })
+
+    return {"answer": reply, "request_id": request_id, "latency_ms": latency_ms}
