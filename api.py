@@ -8,6 +8,49 @@ from collections import deque
 from typing import Optional, Deque, Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
+
+# Load .env locally (Render uses Environment Variables)
+load_dotenv()
+
+# -----------------------------
+# Optional Arize tracing (does not break app if missing)
+# -----------------------------
+def setup_arize_tracing() -> None:
+    """
+    Enables Arize OpenTelemetry tracing if env vars are present:
+      - ARIZE_SPACE_ID
+      - ARIZE_API_KEY
+      - ARIZE_PROJECT_NAME (optional)
+    Safe to call in Render and locally. If not configured, it does nothing.
+    """
+    space_id = os.getenv("ARIZE_SPACE_ID")
+    api_key = os.getenv("ARIZE_API_KEY")
+    project_name = os.getenv("ARIZE_PROJECT_NAME", "sumska1-chatbot")
+
+    if not space_id or not api_key:
+        return
+
+    try:
+        from arize.otel import register
+        from openinference.instrumentation.openai import OpenAIInstrumentor
+
+        tracer_provider = register(
+            space_id=space_id,
+            api_key=api_key,
+            project_name=project_name,
+        )
+        OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
+
+    except Exception:
+        # Don't break production if tracing fails
+        return
+
+
+setup_arize_tracing()
+
+# -----------------------------
+# App imports (after env/tracing)
+# -----------------------------
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -23,10 +66,8 @@ from services.context_payload import build_context_payload
 from services.logger import log_event
 
 # -----------------------------
-# Config
+# OpenAI client
 # -----------------------------
-load_dotenv()
-
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or Render Environment Variables.")
@@ -36,6 +77,9 @@ client = OpenAI(api_key=api_key)
 MODEL_NAME = "gpt-4.1-mini"
 PROMPT_VERSION = "v1"
 
+# -----------------------------
+# Data
+# -----------------------------
 DATA_PATH = "data/jela.json"
 DATA_VERSION = sha256_file(DATA_PATH)
 
@@ -45,8 +89,8 @@ with open(DATA_PATH, "r", encoding="utf-8") as f:
 # -----------------------------
 # RAM session memory
 # -----------------------------
-MAX_SESSION_MESSAGES = 10          # user+assistant messages kept
-SESSION_TTL_SECONDS = 30 * 60      # 30 minutes inactivity
+MAX_SESSION_MESSAGES = 10
+SESSION_TTL_SECONDS = 30 * 60  # 30 minutes
 
 
 class SessionState:
@@ -54,7 +98,7 @@ class SessionState:
         self.messages: Deque[Dict[str, str]] = deque(maxlen=MAX_SESSION_MESSAGES)
         self.last_dish_name: Optional[str] = None
         self.last_category: Optional[str] = None
-        self.last_dish_candidates: Optional[List[str]] = None  # <- NEW: candidates from last category listing
+        self.last_dish_candidates: Optional[List[str]] = None
         self.updated_at: float = time.time()
 
 
@@ -91,30 +135,24 @@ def find_dish_by_name(name: str) -> Optional[Dict[str, Any]]:
 
 
 def resolve_dish_from_session(user_text: str, session: SessionState) -> Optional[Dict[str, Any]]:
-    """
-    Resolve short references like "palačinke" after:
-    - we talked about a specific dish (last_dish_name), OR
-    - we listed a category (last_dish_candidates).
-    """
     t = normalize(user_text)
 
-    # 1) If we previously talked about a specific dish
+    # 1) Last specific dish
     if session.last_dish_name:
         last_name_norm = normalize(session.last_dish_name).replace("-", " ")
         stems = [w for w in last_name_norm.split() if len(w) >= 4]
         if any(stem in t for stem in stems):
             return find_dish_by_name(session.last_dish_name)
 
-    # 2) If we previously listed dishes (category answer), try candidates
+    # 2) Last category candidates
     if session.last_dish_candidates:
         for name in session.last_dish_candidates:
             nn = normalize(name).replace("-", " ")
             words = [w for w in nn.split() if len(w) >= 5]
             if not words:
                 continue
-
-            key = words[0]              # e.g. "palacinke"
-            stem = key[:7]              # e.g. "palacin" (covers declensions: palacinke/palacinkama)
+            key = words[0]
+            stem = key[:7]
             if key in t or (stem and stem in t):
                 return find_dish_by_name(name)
 
@@ -126,10 +164,9 @@ def resolve_dish_from_session(user_text: str, session: SessionState) -> Optional
 # -----------------------------
 app = FastAPI()
 
-# Wix HTML iframe -> allow all origins (no cookies)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],          # Wix HTML iframe
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -180,7 +217,7 @@ def chat(req: ChatRequest):
             "answer": "Napiši pitanje pa ću ti odgovoriti.",
             "session_id": session_id,
             "request_id": request_id,
-            "latency_ms": latency_ms
+            "latency_ms": latency_ms,
         }
 
     log_event({
@@ -192,15 +229,15 @@ def chat(req: ChatRequest):
         "message": user_input,
     })
 
-    # 1) Detect dish/category in current message
+    # 1) Detect dish/category from current message
     dish = find_dish_in_text(user_input, DISHES)
     category = find_category_in_text(user_input, CATEGORY_SYNONYMS) if dish is None else None
 
-    # 2) If nothing found, try resolve from session context
+    # 2) If nothing found, resolve from session context
     if dish is None and category is None:
         dish = resolve_dish_from_session(user_input, session)
 
-    # 3) If still nothing, ask a follow-up (NO LLM call)
+    # 3) If still nothing, ask follow-up (no LLM call)
     if dish is None and category is None:
         latency_ms = int((time.perf_counter() - t0) * 1000)
         log_event({
@@ -222,7 +259,7 @@ def chat(req: ChatRequest):
             "latency_ms": latency_ms,
         }
 
-    # 4) Base system prompt (ENGLISH; user output Serbian)
+    # 4) Base system prompt (EN, output SR)
     base_system_message = {
         "role": "system",
         "content": (
@@ -241,30 +278,27 @@ def chat(req: ChatRequest):
 
     convo_messages: List[Dict[str, str]] = [base_system_message]
 
-    # 5) Add session history (last 10 messages)
+    # 5) Add session history
     convo_messages.extend(list(session.messages))
 
-    # 6) Build structured context payload (JSON) for this turn + update session memory pointers
+    # 6) Build context payload + update session pointers
     if dish is not None:
         payload = build_context_payload(dish=dish, category=None, category_dishes=None)
-
         session.last_dish_name = dish.get("name")
         session.last_category = None
-        session.last_dish_candidates = None  # <- clear candidates when specific dish selected
+        session.last_dish_candidates = None
     else:
         dishes_in_cat = filter_dishes_by_category(DISHES, category)
         payload = build_context_payload(dish=None, category=category, category_dishes=dishes_in_cat)
-
         session.last_category = category
         session.last_dish_name = None
-        session.last_dish_candidates = [d.get("name") for d in dishes_in_cat if d.get("name")]  # <- NEW
+        session.last_dish_candidates = [d.get("name") for d in dishes_in_cat if d.get("name")]
 
     convo_messages.append({
         "role": "system",
         "content": "CONTEXT_JSON:\n" + json.dumps(payload, ensure_ascii=False),
     })
 
-    # 7) Current user message
     convo_messages.append({"role": "user", "content": user_input})
 
     log_event({
@@ -286,7 +320,7 @@ def chat(req: ChatRequest):
 
     reply = (response.choices[0].message.content or "").strip()
 
-    # 8) Post-check (dish mode only): if unknown ingredient appears, override with DB-only answer
+    # 7) Post-check for dish mode
     if payload.get("mode") == "dish":
         allowed = extract_allowed_ingredients(payload) or []
         triggered, unknown_items = detect_unknown_ingredient(reply, allowed)
@@ -311,12 +345,12 @@ def chat(req: ChatRequest):
                 "answer": safe_reply,
                 "session_id": session_id,
                 "request_id": request_id,
-                "latency_ms": latency_ms
+                "latency_ms": latency_ms,
             }
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
-    # 9) Save history (RAM): user + assistant
+    # 8) Save session history
     session.messages.append({"role": "user", "content": user_input})
     session.messages.append({"role": "assistant", "content": reply})
 
@@ -334,5 +368,5 @@ def chat(req: ChatRequest):
         "answer": reply,
         "session_id": session_id,
         "request_id": request_id,
-        "latency_ms": latency_ms
+        "latency_ms": latency_ms,
     }
